@@ -131,8 +131,8 @@
   (check-equal? (hash-ref all-bindings (syntax 'id (set))) 'binding))
 
 (define core-scope (make-scope))
-(define core-forms (set 'lambda 'define-syntax 'quote 'quote-syntax))
-(define core-primitives (set 'datum->syntax 'syntax->datum 'syntax 'list 'cons 'car 'cdr 'map))
+(define core-forms (set 'lambda 'define 'define-syntax 'quote 'quote-syntax))
+(define core-primitives (set 'datum->syntax 'syntax->datum 'syntax 'if 'list 'cons 'car 'cdr 'map 'null? 'set!))
 
 (for ([sym (in-set (set-union core-forms core-primitives))])
   (add-binding! (syntax sym (set core-scope)) sym))
@@ -178,13 +178,13 @@
   (-> env? binding? (or/c location? #f))
   (hash-ref env binding #f))
 
-(define/contract (expand datum env)
-  (-> datum? env? datum?)
+(define/contract (expand datum env [body #f])
+  (->* (datum? env?) (boolean?) datum?)
   (cond
     [(identifier? datum)
      (expand-identifier datum env)]
     [((cons/c identifier? (listof datum?)) datum)
-     (expand-id-list-form datum env)]
+     (expand-id-list-form datum env body)]
     [((listof datum?) datum)
      (expand-application-form datum env)]
     [else (error "bad syntax:" datum)]))
@@ -194,6 +194,7 @@
   (define binding (resolve id))
   (cond
     [(not binding)
+     (writeln all-bindings)
      (error "free variable:" id)]
     [(set-member? core-primitives binding)
      id]
@@ -209,20 +210,26 @@
        [else
         (error "bad syntax:" id)])]))
 
-(define/contract (expand-id-list-form datum env)
-  (-> (cons/c identifier? (listof datum?)) env? datum?)
+(define/contract (expand-id-list-form datum env [body #f])
+  (->* ((cons/c identifier? (listof datum?)) env?) (boolean?) datum?)
   (define binding (resolve (car datum)))
   (case binding
     [(quote quote-syntax)
      (expand-quote datum env)]
     [(lambda)
      (expand-lambda datum env)]
+    [(define)
+     (unless body
+       (error "define in expression context:" datum))
+     datum]
     [(define-syntax)
-     (error "define-syntax in expression context:" datum)]
+     (unless body
+       (error "define-syntax in expression context:" datum))
+     datum]
     [else
-     (define location (env-lookup env binding))
+     (define location (and binding (env-lookup env binding)))
      (if (procedure? location)
-       (expand (apply-transformer datum location) env)
+       (expand (apply-transformer datum location) env body)
        (expand-application-form datum env))]))
 
 (define/contract (expand-quote datum env)
@@ -238,7 +245,7 @@
   (define binding (add-local-binding! binding-id))
   (define bound-body (map (lambda (d) (add-scope d s)) body))
   (define extended-env (env-extend env binding 'variable))
-  (define expanded-body (expand-body bound-body extended-env))
+  (define expanded-body (expand-body bound-body extended-env '()))
   `(,lambda-id (,binding-id) ,@expanded-body))
 
 (define/contract (apply-transformer datum transformer)
@@ -252,24 +259,42 @@
   (-> (listof datum?) env? datum?)
   (map (lambda (d) (expand d env)) datum))
 
-(define/contract (expand-body data env)
-  (-> (listof datum?) env? (listof datum?))
-  (define rest data)
-  (define (define-syntax-form? datum)
-    (and
-      (pair? datum)
-      (identifier? (car datum))
-      (eq? (resolve (car datum)) 'define-syntax)))
-  (for ([datum (in-list data)])
-    ; TODO this doesn't handle the case that something expands to a define-syntax form
-    #:break (not (define-syntax-form? datum))
-    (set! rest (cdr rest))
-    (define-values (s binding transformer) (expand-define-syntax datum))
-    (set! rest (map (lambda (d) (add-scope d s)) rest))
-    (set! env (env-extend env binding transformer)))
-  (map (lambda (d) (expand d env)) rest))
+(define/contract (expand-body data env defines)
+  (-> (listof datum?) env? (listof (list/c identifier? identifier? datum?)) (listof datum?))
+  ; TODO: this issue is that the expansion taking place here does not respect the new scopes that have been applied.
+  (when (null? data)
+    (error "unexpected end of body"))
+  (define expanded (expand (car data) env #t))
+  (define id (and (pair? expanded) (identifier? (car expanded)) (car expanded)))
+  (define id-binding (and id (resolve id)))
+  (case id-binding
+    [(define)
+     (define-values (s binding) (process-define expanded))
+     (expand-body
+       (map (lambda (d) (add-scope d s)) (cdr data))
+       (env-extend env binding 'variable)
+       (map (lambda (d) (add-scope d s)) (append defines (list expanded))))]
+    [(define-syntax)
+     (define-values (s binding transformer) (process-define-syntax expanded))
+     (expand-body
+       (map (lambda (d) (add-scope d s)) (cdr data))
+       (env-extend env binding transformer)
+       (map (lambda (d) (add-scope d s)) defines))]
+    [else
+     (define expanded-list (cons expanded (map (lambda (d) (expand d env)) (cdr data))))
+     ; TODO: should the RHS expressions of the defines be evaluated with all scopes, not just the scopes of the bindings preceding them?
+     (define expanded-defines (map (lambda (d) (expand-define d env)) defines))
+     `(,@expanded-defines ,@expanded-list)]))
 
-(define/contract (expand-define-syntax datum)
+(define/contract (process-define datum)
+  (-> (list/c identifier? identifier? datum?) (values scope? binding?))
+  (match-define `(,define-id ,id ,expression) datum)
+  (define s (make-scope))
+  (define binding-id (add-scope id s))
+  (define binding (add-local-binding! binding-id))
+  (values s binding))
+
+(define/contract (process-define-syntax datum)
   (-> (list/c identifier? identifier? datum?) (values scope? binding? transformer?))
   (match-define `(,define-syntax-id ,id ,transformer) datum)
   ; TODO: one major difference is new scopes are introduced for every binding, not just macro uses. what are the implications of this?
@@ -277,8 +302,15 @@
   (define binding-id (add-scope id s))
   (define binding (add-local-binding! binding-id))
   ; TODO: should the transformer expression be in the bound region of the keyword?
+  ; TODO: should the transformer expression be in the bound region of the defines?
   (define transformer-value (eval-compiled (compile (expand transformer empty-env))))
   (values s binding transformer-value))
+
+(define/contract (expand-define datum env)
+  (-> (list/c identifier? identifier? datum?) env? datum?)
+  (match-define `(,define-id ,binding-id ,expression) datum)
+  (define expanded-expression (expand expression env))
+  `(,define-id ,binding-id ,expanded-expression))
 
 (module+ test
   (define binding/a (gensym))
@@ -392,4 +424,24 @@
 	       (quote-syntax x)))
 	   (let (x 'bar)
 	     (other-x)))))
-    'foo))
+    'foo)
+
+  (check-equal?
+    (run
+      (with-let
+        '(let (x 'bar)
+           (define x 'foo)
+           x)))
+    'foo)
+
+  (check-equal?
+    (run
+      (with-let
+        '(let (x '(foo bar baz))
+           (define last
+             (lambda (l)
+               (if (null? (cdr l))
+                 (car l)
+                 (last (cdr l)))))
+           (last x))))
+    'baz))
