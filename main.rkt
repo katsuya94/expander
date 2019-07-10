@@ -131,7 +131,7 @@
   (check-equal? (hash-ref all-bindings (syntax 'id (set))) 'binding))
 
 (define core-scope (make-scope))
-(define core-forms (set 'lambda 'define 'define-syntax 'quote 'quote-syntax))
+(define core-forms (set 'lambda 'begin 'define 'define-syntax 'quote 'quote-syntax))
 (define core-primitives (set 'datum->syntax 'syntax->datum 'syntax 'if 'list 'cons 'car 'cdr 'map 'null? 'set!))
 
 (for ([sym (in-set (set-union core-forms core-primitives))])
@@ -218,6 +218,8 @@
      (expand-quote datum env)]
     [(lambda)
      (expand-lambda datum env)]
+    [(begin)
+     (if body datum (expand-begin datum env))]
     [(define)
      (unless body
        (error "define in expression context:" datum))
@@ -248,6 +250,12 @@
   (define expanded-body (expand-body bound-body extended-env '()))
   `(,lambda-id (,binding-id) ,@expanded-body))
 
+(define/contract (expand-begin datum env)
+  (-> (cons/c identifier? (listof datum?)) env? datum?)
+  (match-define `(,begin-id ,@body) datum)
+  (define expanded-body (expand-body body env '()))
+  `(,begin-id ,@expanded-body))
+
 (define/contract (apply-transformer datum transformer)
   (-> datum? transformer? datum?)
   (define s (make-scope))
@@ -268,6 +276,12 @@
   (define id (and (pair? expanded) (identifier? (car expanded)) (car expanded)))
   (define id-binding (and id (resolve id)))
   (case id-binding
+    [(begin)
+     (define forms (process-begin expanded))
+     (expand-body
+       (append forms (cdr data))
+       env
+       defines)]
     [(define)
      (define-values (s binding) (process-define expanded))
      (expand-body
@@ -285,6 +299,11 @@
      ; TODO: should the RHS expressions of the defines be evaluated with all scopes, not just the scopes of the bindings preceding them?
      (define expanded-defines (map (lambda (d) (expand-define d env)) defines))
      `(,@expanded-defines ,@expanded-list)]))
+
+(define/contract (process-begin datum)
+  (-> (cons/c identifier? (listof datum?)) (listof datum?))
+  (match-define `(,begin-id ,@body) datum)
+  body)
 
 (define/contract (process-define datum)
   (-> (list/c identifier? identifier? datum?) (values scope? binding?))
@@ -368,15 +387,14 @@
 
   (check-equal?
     (run
-      '((lambda (_)
-          (define-syntax macro
-            (lambda (stx) (quote-syntax (quote 4))))
-          (macro))
-        '#f))
+      '(begin
+         (define-syntax macro
+           (lambda (stx) (quote-syntax (quote 4))))
+         (macro)))
     4)
 
   (define (with-let . body)
-    `((lambda (_)
+    `(begin
         (define-syntax let
           (lambda (stx)
             (list
@@ -386,8 +404,7 @@
                   (list (car (car (cdr stx))))
                   (cdr (cdr stx))))
               (car (cdr (car (cdr stx)))))))
-        ,@body)
-      '#f))
+        ,@body))
 
   (check-equal?
     (run
@@ -444,4 +461,12 @@
                  (car l)
                  (last (cdr l)))))
            (last x))))
-    'baz))
+    'baz)
+
+  (check-equal?
+    (run
+      '(begin
+         (begin
+           (define x 'foo))
+         x))
+    'foo))
