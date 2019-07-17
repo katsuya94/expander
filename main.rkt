@@ -89,6 +89,10 @@
   (-> datum? scope? datum?)
   (adjust-scope datum scope set-add))
 
+(define/contract (map-scope data scope)
+  (-> (listof datum?) scope? (listof datum?))
+  (map (lambda (d) (add-scope d scope)) data))
+
 (define/contract (flip-scope datum scope)
   (-> datum? scope? datum?)
   (adjust-scope datum scope set-flip))
@@ -132,7 +136,7 @@
 
 (define core-scope (make-scope))
 (define core-forms (set 'lambda 'begin 'define 'define-syntax 'quote 'quote-syntax))
-(define core-primitives (set 'datum->syntax 'syntax->datum 'syntax 'if 'list 'cons 'car 'cdr 'map 'null? 'set!))
+(define core-primitives (set 'datum->syntax 'syntax->datum 'syntax 'if 'list 'cons 'car 'cdr 'map 'null? 'set! 'void))
 
 (for ([sym (in-set (set-union core-forms core-primitives))])
   (add-binding! (syntax sym (set core-scope)) sym))
@@ -214,8 +218,10 @@
   (->* ((cons/c identifier? (listof datum?)) env?) (boolean?) datum?)
   (define binding (resolve (car datum)))
   (case binding
-    [(quote quote-syntax)
+    [(quote)
      (expand-quote datum env)]
+    [(quote-syntax)
+     (expand-quote-syntax datum env)]
     [(lambda)
      (expand-lambda datum env)]
     [(begin)
@@ -239,6 +245,11 @@
   (match-define `(,quote-id ,arg) datum)
   `(,quote-id ,arg))
 
+(define/contract (expand-quote-syntax datum env)
+  (-> (list/c identifier? datum?) env? datum?)
+  (match-define `(,quote-syntax-id ,arg) datum)
+  `(,quote-syntax-id ,arg))
+
 (define/contract (expand-lambda datum env)
   (-> (cons/c identifier? (cons/c (list/c identifier?) (listof datum?))) env? datum?)
   (match-define `(,lambda-id (,formal) ,@body) datum)
@@ -248,13 +259,13 @@
   (define bound-body (map (lambda (d) (add-scope d s)) body))
   (define extended-env (env-extend env binding 'variable))
   (define expanded-body (expand-body bound-body extended-env '()))
-  `(,lambda-id (,binding-id) ,@expanded-body))
+  `(,lambda-id (,binding-id) ,expanded-body))
 
 (define/contract (expand-begin datum env)
   (-> (cons/c identifier? (listof datum?)) env? datum?)
   (match-define `(,begin-id ,@body) datum)
   (define expanded-body (expand-body body env '()))
-  `(,begin-id ,@expanded-body))
+  `(,begin-id ,expanded-body))
 
 (define/contract (apply-transformer datum transformer)
   (-> datum? transformer? datum?)
@@ -267,8 +278,8 @@
   (-> (listof datum?) env? datum?)
   (map (lambda (d) (expand d env)) datum))
 
-(define/contract (expand-body data env defines)
-  (-> (listof datum?) env? (listof (list/c identifier? identifier? datum?)) (listof datum?))
+(define/contract (expand-body data env definitions)
+  (-> (listof datum?) env? (listof (list/c identifier? identifier? datum?)) datum?)
   ; TODO: this issue is that the expansion taking place here does not respect the new scopes that have been applied.
   (when (null? data)
     (error "unexpected end of body"))
@@ -281,24 +292,36 @@
      (expand-body
        (append forms (cdr data))
        env
-       defines)]
+       definitions)]
     [(define)
      (define-values (s binding) (process-define expanded))
      (expand-body
-       (map (lambda (d) (add-scope d s)) (cdr data))
+       (map-scope (cdr data) s)
        (env-extend env binding 'variable)
-       (map (lambda (d) (add-scope d s)) (append defines (list expanded))))]
+       (map-scope (append definitions (list expanded)) s))]
     [(define-syntax)
      (define-values (s binding transformer) (process-define-syntax expanded))
      (expand-body
-       (map (lambda (d) (add-scope d s)) (cdr data))
+       (map-scope (cdr data) s)
        (env-extend env binding transformer)
-       (map (lambda (d) (add-scope d s)) defines))]
+       (map-scope definitions s))]
     [else
-     (define expanded-list (cons expanded (map (lambda (d) (expand d env)) (cdr data))))
-     ; TODO: should the RHS expressions of the defines be evaluated with all scopes, not just the scopes of the bindings preceding them?
-     (define expanded-defines (map (lambda (d) (expand-define d env)) defines))
-     `(,@expanded-defines ,@expanded-list)]))
+     (define expanded-body-expressions (cons expanded (map (lambda (d) (expand d env)) (cdr data))))
+     (define expanded-set-expressions
+       (for/list ([definition (in-list definitions)])
+         (match-define `(,define-id ,id ,rhs) definition)
+         (define expanded-rhs (expand rhs env))
+         `(,(syntax 'set! (set core-scope)) ,id ,expanded-rhs)))
+     (define expanded-body
+       `(,(syntax 'begin (set core-scope))
+         ,@expanded-set-expressions
+         ,@expanded-body-expressions))
+     (for ([definition (in-list definitions)])
+       (match-define `(,define-id ,id ,rhs) definition)
+       (set! expanded-body
+         `((,(syntax 'lambda (set core-scope)) (,id) ,expanded-body)
+           (,(syntax 'void (set core-scope))))))
+     expanded-body]))
 
 (define/contract (process-begin datum)
   (-> (cons/c identifier? (listof datum?)) (listof datum?))
@@ -307,7 +330,7 @@
 
 (define/contract (process-define datum)
   (-> (list/c identifier? identifier? datum?) (values scope? binding?))
-  (match-define `(,define-id ,id ,expression) datum)
+  (match-define `(,define-id ,id ,rhs) datum)
   (define s (make-scope))
   (define binding-id (add-scope id s))
   (define binding (add-local-binding! binding-id))
@@ -351,7 +374,12 @@
        [(lambda)
         (match-define `(,lambda-id (,id) ,@body) datum)
         `(lambda (,(resolve id)) ,@(map compile body))]
+       [(begin)
+        (match-define `(,begin-id ,@body) datum)
+        `(begin ,@(map compile body))]
        [else
+        (when (set-member? core-forms car-binding)
+          (error "unexpected core form after expansion:" datum))
         (map compile datum)])]
     [(identifier? datum)
      (define binding (resolve datum))
