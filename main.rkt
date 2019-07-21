@@ -135,7 +135,7 @@
   (check-equal? (hash-ref all-bindings (syntax 'id (set))) 'binding))
 
 (define core-scope (make-scope))
-(define core-forms (set 'lambda 'begin 'define 'define-syntax 'module 'quote 'quote-syntax))
+(define core-forms (set 'lambda 'begin 'define 'define-syntax 'module 'import 'quote 'quote-syntax))
 (define core-primitives (set 'datum->syntax 'syntax->datum 'syntax 'if 'list 'cons 'car 'cdr 'map 'null? 'set! 'void))
 
 (for ([sym (in-set (set-union core-forms core-primitives))])
@@ -243,6 +243,10 @@
      (unless body
        (error "module in expression context:" datum))
      datum]
+    [(import)
+     (unless body
+       (error "import in expression context:" datum))
+     datum]
     [else
      (define location (and binding (env-lookup env binding)))
      (if (procedure? location)
@@ -340,7 +344,15 @@
        (map-scope (append definition-ids module-definition-ids) s)
        (map-scope (append pre-forms module-body-forms) s)
        (hash-set id-scopes id s))]
-    #;[(import)]
+    [(import)
+     (define interface (process-import expanded env))
+     (define scopes (set->list interface))
+     (process-body
+       (foldl (lambda (s ds) (map-scope ds s)) (cdr data) scopes)
+       env
+       (foldl (lambda (s ds) (map-scope ds s)) definition-ids scopes)
+       (foldl (lambda (s ds) (map-scope ds s)) pre-forms scopes)
+       id-scopes)]
     [else
      (values `(,@pre-forms ,@data) env definition-ids id-scopes)]))
 
@@ -389,6 +401,13 @@
 	  (cdr id+scope)))))
   (set! extended-env (env-extend extended-env binding interface))
   (values s extended-env binding-id body-forms definition-ids))
+
+(define/contract (process-import datum env)
+  (-> (list/c identifier? identifier?) env? interface?)
+  (match-define `(,import-id ,id) datum)
+  (define binding (resolve id))
+  (define interface (env-lookup env binding))
+  interface)
 
 (module+ test
   (define binding/a (gensym))
@@ -572,4 +591,22 @@
            (set! x (cons 'bar x)))
          (define x (cons 'foo x))
          x))
-    `(foo bar . ,(void))))
+    `(foo bar . ,(void)))
+
+  (check-equal?
+    (run
+      '(begin
+         (module A (x)
+           (define x 'foo))
+	 (import A)
+         x))
+    'foo)
+  
+  (check-equal?
+    (run
+      '(begin
+	 (module A (x)
+	   (define x 'foo))
+	 (define x 'bar)
+	 (cons x (begin (import A) x))))
+    '(bar . foo)))
