@@ -161,13 +161,17 @@
 
 (define empty-env (hash))
 
+(define/contract (binds? binding-id id)
+  (-> identifier? identifier? boolean?)
+  (and (eq? (syntax-datum binding-id) (syntax-datum id))
+       (subset? (syntax-scopes binding-id) (syntax-scopes id))))
+
 (define/contract (resolve id)
   (-> identifier? (or/c binding? #f))
   (define candidate-id-counts
     (for/list
       ([candidate-id (in-hash-keys all-bindings)]
-       #:when (and (eq? (syntax-datum candidate-id) (syntax-datum id))
-                   (subset? (syntax-scopes candidate-id) (syntax-scopes id))))
+       #:when (binds? candidate-id id))
       (cons candidate-id (set-count (syntax-scopes candidate-id)))))
   (cond
     [(empty? candidate-id-counts)
@@ -377,6 +381,13 @@
   (define binding (add-local-binding! binding-id))
   (define bound-body (map-scope body s))
   (define-values (body-forms extended-env definition-ids id-scopes) (process-body bound-body env '() '() (hash)))
+  (define interface
+    (list->set
+      (for/list ([export-id (in-list export-ids)])
+	(for/first ([id+scope (in-hash-pairs id-scopes)]
+	            #:when (binds? export-id (car id+scope)))
+	  (cdr id+scope)))))
+  (set! extended-env (env-extend extended-env binding interface))
   (values s extended-env binding-id body-forms definition-ids))
 
 (module+ test
@@ -470,6 +481,18 @@
       (with-let
         '(let (x 'foo) (cons x 'bar))))
     '(foo . bar))
+
+  (check-exn
+    exn:fail?
+    (lambda ()
+      (run
+	(with-let
+	  '(begin
+	     (define-syntax macro
+	       (lambda (stx) (quote-syntax x)))
+	     (let (x 'foo)
+	       (macro))))))
+    "free variable:")
 
   (check-equal?
     (run
